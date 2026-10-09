@@ -1,0 +1,14 @@
+rules:
+  - id: raw-sql-built-from-string
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >
+      SQL query is built with string interpolation or concatenation, which allows
+      SQL injection. Use bind parameters or replacements instead, for example
+      sequelize.query("... WHERE email = :email", { replacements: { email } }).
+    metadata:
+      cwe: "CWE-89: SQL Injection"
+      owasp: "A03:2021 - Injection"
+    pattern-either:
+      - pattern: $DB.query(`...${$X}...`, ...)
+      - pattern: $DB.query($A + $B, ...)
