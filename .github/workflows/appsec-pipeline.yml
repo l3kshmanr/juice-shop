@@ -1,23 +1,27 @@
 name: AppSec Pipeline
 
-# Runs on every push, every pull request, and manually from the Actions tab.
+# v2 changes:
+#  - Semgrep: exclude training snippets + spec files (noise reduction)
+#  - Trivy: generate lockfiles first (repo has none), fail if SBOM is empty
+#  - DAST: print app logs on failure so we can debug
+#  - runs-on pinned to ubuntu-24.04 (ubuntu-latest is migrating to 26 on Oct 19)
+
 on:
   push:
     branches: [master, main]
   pull_request:
   workflow_dispatch:
 
-# Least privilege: the pipeline can only read the repo.
 permissions:
   contents: read
 
 jobs:
   # ---------------------------------------------------------------
-  # 1. SAST - scans SOURCE CODE for insecure patterns (no app running)
+  # 1. SAST
   # ---------------------------------------------------------------
   sast-semgrep:
     name: SAST (Semgrep)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -30,10 +34,12 @@ jobs:
               --config p/nodejs \
               --config .semgrep/rules \
               --severity ERROR \
+              --exclude codefixes \
+              --exclude '*.spec.ts' \
               --json-output=semgrep-report.json \
               --error
-        # --severity ERROR = only the high-confidence/high-impact rules count
-        # --error          = exit code 1 if anything is found -> THIS is the gate
+        # --exclude codefixes : Juice Shop's intentionally vulnerable training snippets, not shipped logic
+        # --exclude '*.spec.ts': unit tests
 
       - name: Keep the report
         if: always()
@@ -43,37 +49,51 @@ jobs:
           path: semgrep-report.json
 
   # ---------------------------------------------------------------
-  # 2. Secrets - API keys, tokens, private keys committed to the repo
+  # 2. Secrets
   # ---------------------------------------------------------------
   secrets-gitleaks:
     name: Secrets (Gitleaks)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # full history: a secret deleted in a later commit is still leaked
+          fetch-depth: 0
 
       - name: Gitleaks scan
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Free for personal accounts. Organisation repos need a license key.
 
   # ---------------------------------------------------------------
-  # 3. SCA - vulnerable third-party libraries + SBOM
+  # 3. SCA + SBOM
   # ---------------------------------------------------------------
   sca-trivy:
     name: SCA + SBOM (Trivy)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
-      - name: Generate SBOM (CycloneDX) - the inventory of every dependency
+      # Trivy reads LOCKFILES (package-lock.json). This repo does not commit one,
+      # so Trivy saw zero dependencies and passed with an empty SBOM.
+      # Resolve the dependency tree into lockfiles first (no install, no scripts).
+      - name: Generate lockfiles (backend + frontend)
+        run: |
+          npm install --package-lock-only --package-lock=true --ignore-scripts --legacy-peer-deps
+          (cd frontend && npm install --package-lock-only --package-lock=true --ignore-scripts --legacy-peer-deps)
+          ls -la package-lock.json frontend/package-lock.json
+
+      - name: Generate SBOM (CycloneDX)
         run: |
           docker run --rm -v "${PWD}:/project" aquasec/trivy:latest fs \
             --format cyclonedx \
             --output /project/sbom.cdx.json \
             /project
+
+      - name: Sanity check - SBOM must not be empty
+        run: |
+          COUNT=$(jq '.components | length' sbom.cdx.json)
+          echo "SBOM components: $COUNT"
+          test "$COUNT" -gt 0
 
       - name: Vulnerability gate (High/Critical that have a fix available)
         run: |
@@ -83,8 +103,6 @@ jobs:
             --ignore-unfixed \
             --exit-code 1 \
             /project
-        # --exit-code 1 on findings = the gate
-        # --ignore-unfixed = don't block devs on things they cannot fix yet
 
       - name: Keep the SBOM
         if: always()
@@ -94,17 +112,18 @@ jobs:
           path: sbom.cdx.json
 
   # ---------------------------------------------------------------
-  # 4. DAST - attack the RUNNING app (built from this exact commit)
+  # 4. DAST
   # ---------------------------------------------------------------
   dast-zap:
     name: DAST (ZAP baseline)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
       - name: Build the app from this commit
         run: docker build -t app-under-test .
-        # Slow? Replace with: docker pull bkimminich/juice-shop && docker tag bkimminich/juice-shop app-under-test
+        # If this step is the one that fails, replace the line above with:
+        #   docker pull bkimminich/juice-shop:latest && docker tag bkimminich/juice-shop:latest app-under-test
 
       - name: Start the app
         run: |
@@ -123,8 +142,10 @@ jobs:
             ghcr.io/zaproxy/zaproxy:stable \
             zap-baseline.py -t http://target:3000 \
               -r zap-report.html -J zap-report.json -I
-        # -I = report-only. To gate on specific alerts, add a rules file with -c
-        #      and set the chosen rule IDs to FAIL.
+
+      - name: Debug - show app logs if anything failed
+        if: failure()
+        run: docker logs target || true
 
       - name: Keep the ZAP report
         if: always()
